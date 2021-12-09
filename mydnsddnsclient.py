@@ -1,0 +1,487 @@
+#!/usr/bin/python3 -u
+# -*- coding: utf-8 -*-
+
+#--------------------------------------------------------------------#
+# mydnsddnsclient.py  Ver. 1.0.0(2021/12/20)                         #
+#   MyDNS ダイナミックDNS クライアント(ipv4複数アカウント対応版)     #
+#     Copyright (C) 2021 chidipy  http://chidipy.jpn.com/            #
+#--------------------------------------------------------------------#
+
+#--------------------------------------------------------------------#
+# 設定                                                               #
+#--------------------------------------------------------------------#
+# MyDNSのユーザ名、パスワード
+# -書式-
+#   USER:PASSWORD,USER:PASSWORD,....
+# -例-
+#   dns000001:PaSsW0rd
+#   dns000001:PaSsW0rd,dns000002:PaSsW0rd,dns000003:PaSsW0rd
+USER_PASSWORD_LIST=""
+
+# 必要なときのみ実行する(False/True)
+#  有効にするとIPアドレスに変化があったときのみ、アップデートを実行します。
+#  ただしIPアドレスに継続して変化が無いときはDAYS_FORCE_UPDATEで指定する日数後に
+#  強制アップデートを実行します。
+#  IPアドレスチェックで警告になる場合は無効にしてください。
+ENABLE_EXEC_ONLY_WHEN_NEEDED=True
+# 強制的にDDNSを更新する日数間隔
+DAYS_FORCE_UPDATE=1
+
+# 前回IPアドレスと最終更新日時を記録するファイル
+PATH_PRECHANGE="/var/lib/mydnsddnsclient.txt"
+
+# ログの出力パス
+PATH_LOG="/var/log/mydnsddnsclient.log"
+
+# 冗長ログ出力(False/True)
+LOG_VERBOSE=False
+
+#--[簡易実装]メール通知----------
+#  上記ENABLE_EXEC_ONLY_WHEN_NEEDED=Falseの場合は失敗時のみメール送信
+# メールサーバホスト名（空値の場合、メール通知は無効）
+MAIL_HOST=""
+# メールサーバポート番号
+MAIL_PORT=""
+# メールサーバユーザ名（空値の場合、認証実施しない）
+MAIL_USER=""
+MAIL_PASSWORD=""
+# 通知メールFromメールアドレス
+MAIL_FROM=""
+# 通知メールToメールアドレス
+MAIL_TO=""
+# 通知メール件名
+MAIL_SUBJECT="MyDNS DDNS Client(Non-Formula)"
+
+#--------------------------------------------------------------------#
+# 定数                                                               #
+#--------------------------------------------------------------------#
+LOGLEVEL_INFO="INFO"
+LOGLEVEL_WARN="WARN"
+LOGLEVEL_ERROR="ERROR"
+
+#--------------------------------------------------------------------#
+# モジュール読み込み                                                 #
+#--------------------------------------------------------------------#
+import sys
+import requests
+import fcntl
+import os
+import re
+from datetime import datetime,date,timedelta
+import socket
+import ssl
+import urllib.request
+import smtplib
+from email.mime.text import MIMEText
+from email.utils import formatdate
+
+#--------------------------------------------------------------------#
+# グローバル変数                                                     #
+#--------------------------------------------------------------------#
+messagestore=None
+
+#--------------------------------------------------------------------#
+# 関数                                                               #
+#--------------------------------------------------------------------#
+def write_log(msg,level="DEBUG"):
+    flag_writable=True
+    global messagestore
+    # メッセージ組み立て
+    output="{0} {1:<5} {2}".format(str(datetime.now()) ,level,msg)
+    
+    if messagestore == None:
+        messagestore = output
+    else:
+        messagestore = messagestore + "\n" + output
+    
+    if os.access(os.path.dirname(PATH_LOG),os.W_OK) == False:
+        flag_writable=False
+    if os.path.exists(PATH_LOG)==True:
+        if os.access(PATH_LOG,os.W_OK) == False:
+            flag_writable=False
+    if flag_writable==False:
+        sys.stderr.write("LOGGING ERROR!:"+output)
+        return
+    
+    try:
+        file_output = open(PATH_LOG,"a",encoding='utf-8')
+        fcntl.flock(file_output,fcntl.LOCK_SH)
+        file_output.write(output+"\n")
+        fcntl.flock(file_output,fcntl.LOCK_UN)
+        file_output.close()
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        print(output)
+        print("Failed to write log. path:{} reason:{}".format(PATH_LOG,str(exc_value)))
+        
+def send_mail(host,port,user,password,from_address,to_address,subject,message):
+    if host == "" :
+        return True
+    
+    msg = MIMEText(message)
+    msg['Subject'] = subject
+    msg['From'] = from_address
+    msg['To'] = to_address
+    msg['Date'] = formatdate()
+    
+    try:
+        objsmtp = smtplib.SMTP(host,port)
+        objsmtp.ehlo()
+        objsmtp.starttls()
+        objsmtp.ehlo()
+        if user !="":
+            objsmtp.login(user,password)
+        objsmtp.sendmail(from_address,to_address,msg.as_string())
+        objsmtp.close()
+    except:
+        return False
+    
+    return True
+
+def get_globalip_inetip():
+    gip=None
+    errmsg=None
+    
+    try:
+        response=requests.get('http://inet-ip.info/ip')
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to get global ip address. reason:" + str(exc_value)
+        return gip,errmsg
+    
+    if response.status_code != 200 :
+        errmsg = "Failed to get global ip address. status_code:" + str(response.status_code)
+        return gip,errmsg
+    
+    gip=response.text
+    
+    return gip,errmsg
+
+def get_globalip_dyndns():
+    gip=None
+    errmsg=None
+    
+    try:
+        response=requests.get('http://checkip.dyndns.com/')
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to get global ip address. reason:" + str(exc_value)
+        return gip,errmsg
+    
+    if response.status_code != 200 :
+        errmsg = "Failed to get global ip address. status_code:" + str(response.status_code)
+        return gip,errmsg
+    
+    html=response.text
+    gip=html.split(':')[1].strip().rstrip('</body></html>\r\n')
+    
+    return gip,errmsg
+
+def get_globalip():
+    gip=None
+    errmsg=None
+    
+    (gip,errmsg)=get_globalip_inetip()
+    if errmsg != None :
+        write_log("inetip:" + errmsg,LOGLEVEL_WARN)
+    else:
+        return gip,errmsg
+        
+    (gip,errmsg)=get_globalip_dyndns()
+    if errmsg != None :
+         write_log("dyndns:" + errmsg,LOGLEVEL_WARN)
+    else:
+        return gip,errmsg
+    
+    return gip,errmsg
+
+def get_prechange(path_history):
+    preip=None
+    prechange=None
+    dt_timestamp=None
+    errmsg=None
+    
+    # 履歴ファイル存在確認
+    if os.path.exists(path_history) == False:
+        # 存在しない場合は初回
+        return "",datetime.strptime("1970-01-01 00:00:00",'%Y-%m-%d %H:%M:%S'),errmsg
+
+    if os.access(path_history,os.R_OK) == False:
+        errmsg="The file does not exist or does not have read permission. path:" + path_history
+        
+        return preip,dt_timestamp,errmsg
+    
+    try :
+        fh = open(PATH_PRECHANGE,"r",encoding='utf-8')
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to open file. path:{} reason:{}".format(PATH_LOG,str(exc_value))
+        return preip,dt_timestamp,errmsg
+
+    for getline in fh:
+        regexp=r'^([^\t]+?)\t(.+?)$'
+        try:
+            pattern=re.compile(regexp)
+        except:
+            (exc_type,exc_value,exc_traceback)=sys.exc_info()
+            errmsg = "Failed to regexp compile. regexp:{} reason:{}".format(regexp,str(exc_value))
+            return preip,dt_timestamp,errmsg
+
+        match=pattern.search(getline)
+        if match != None:
+            preip=match.group(1)
+            str_timestamp=match.group(2)
+            dt_timestamp=datetime.strptime(str_timestamp,'%Y-%m-%d %H:%M:%S')
+
+        break
+
+    fh.close()
+    
+    if preip=="" or preip == None or str_timestamp == "" or str_timestamp == None :
+        errmsg="Failed to get ip address or change timestamp."
+        return preip,dt_timestamp,errmsg
+
+    return preip,dt_timestamp,errmsg
+
+def update_ip(usrpwd):
+    errmsg = None
+    ipaddr_get = ''
+
+    # return errmsg,ipaddr_get
+
+    # 参考 
+    # https://mydns111111:tp5YgZv4@ipv4.mydns.jp/login.html
+
+
+    url="https://{}@ipv4.mydns.jp/login.html".format(usrpwd)
+    try:
+        response = requests.get(url)
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to communicate update. reason:" + str(exc_value)
+        return errmsg,ipaddr_get
+
+    if response.status_code == 401 :
+        # 認証エラー
+        errmsg = "Failed to auth :{}".format(response.text)
+        return errmsg,ipaddr_get
+    elif response.status_code != 200 :
+        # サーバエラーなど
+        errmsg = "response code :{}".format(response.status_code)
+        return errmsg,ipaddr_get
+    
+    html=response.text
+    
+    # 念のため応答文字列をチェック
+    regexp=r'Login and IP address notify OK\.'
+    try:
+        pattern=re.compile(regexp)
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to regexp compile. regexp:{} reason:{}".format(regexp,str(exc_value))
+        return errmsg,ipaddr_get
+
+    # 未定義応答チェック
+    match=pattern.search(html)
+    if match == None :
+        #不明な応答
+        errmsg = "Failed to update. response:{}".format(html)
+        return errmsg,ipaddr_get
+    # マッチした場合、アップデート成功
+
+    # 成功している場合、リモートIPアドレスを取得
+    regexp=r'REMOTE ADDRESS:.+?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})<'
+    try:
+        pattern=re.compile(regexp)
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to regexp compile. regexp:{} reason:{}".format(regexp,str(exc_value))
+        return errmsg,ipaddr_get
+    match=pattern.search(html)
+    if match:
+        try:
+            ipaddr_get=match.group(1)
+        except:
+            # IPアドレスに該当する部分が取得できなった
+            errmsg = "Failed to get REMOTE ADDRESS. response:{}".format(html)
+            ipaddr_get = ''
+            return errmsg,ipaddr_get
+
+    if ipaddr_get == None :
+            ipaddr_get =''
+        
+    return errmsg,ipaddr_get
+        
+
+def update_ip_all(userpasswordlist):
+    errmsg = None 
+    flag_success = True
+
+    # カンマ区切りの文字列をリスト可
+    listuserpassword=userpasswordlist.split(',')
+    for userpassword in listuserpassword:
+        ipaddress_update = ''
+
+        # 書式チェック
+        listidpwd=userpassword.split(':')
+        masterid=listidpwd[0]
+        try:
+            password=listidpwd[1]
+        except:
+            errmsg="Password not listed."
+            write_log(masterid + ":" +errmsg,LOGLEVEL_WARN)
+            continue
+        
+        # IPアドレス更新
+        errmsg,ipaddress_update = update_ip(userpassword)
+        if errmsg != None :
+            flag_success = False
+            write_log(masterid + ":" +errmsg,LOGLEVEL_WARN)
+        else:
+            write_log("{}: The IP address update was successful. ip address:{}".format(masterid,ipaddress_update),LOGLEVEL_INFO)
+
+    if flag_success ==  False :
+        # 一つでもエラーがあった場合は失敗にする
+        write_log("",LOGLEVEL_ERROR)
+        return False,ipaddress_update
+    
+    return True,ipaddress_update
+
+def update_prechange(path_history,gip):
+    errmsg=None
+    # 履歴ファイルが存在するディレクトリに書き込み権限があることを確認
+    if os.access(os.path.dirname(path_history),os.W_OK) == False:
+        #ディレクトリパーミッションエラー
+        errmsg="The directory does not exist or does not have write permission. path:" + os.path.dirname(path_history)
+        return errmsg
+
+    if os.path.exists(path_history) == True :
+        if os.access(path_history,os.W_OK) == False:
+            #ファイルパーミッションエラー
+            errmsg="The file does not exist or does not have write permission. path:" + path_history
+            return errmsg
+    
+    # IPアドレス\t更新時刻'%Y-%m-%d %H:%M:%S'
+    ip = gip
+    str_timestamp_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    try :
+        fh = open(path_history,"w",encoding='utf-8')
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to open file. path:{} reason:{}".format(path_history,str(exc_value))
+        return errmsg
+    
+    try:
+        fh.write('{}\t{}'.format(ip,str_timestamp_now))
+        fh.close()
+    except:
+        (exc_type,exc_value,exc_traceback)=sys.exc_info()
+        errmsg = "Failed to write file. path:{} reason:{}".format(path_history,str(exc_value))
+        return errmsg
+    
+    return errmsg
+
+def check_ip_dns(gip,fqdnlist):
+    errmsg = None 
+    result = True
+
+    # カンマ区切りの文字列をリスト可
+    listfqdn=fqdnlist.split(',')
+    for strfqdn in listfqdn:
+        try:
+            ip=socket.gethostbyname(strfqdn)
+            if LOG_VERBOSE == True : write_log("dns {}:{}".format(strfqdn,ip),LOGLEVEL_INFO)
+            if gip != ip :
+                write_log("Detected that the resolved name and the current IP address are different. fqdn:{} ip address:{} current ip address:{}".format(strfqdn,ip,gip),LOGLEVEL_INFO)
+                result = False
+        except:
+            # 存在しないFQDNも例外になる
+            write_log("FQDNs that cannot be resolved by name. fqdn:{}".format(strfqdn),LOGLEVEL_INFO)
+            result = False
+
+    return result,errmsg
+
+
+#--------------------------------------------------------------------#
+# メイン処理                                                         #
+#--------------------------------------------------------------------#
+def main():
+    gip=None
+    errmsg=None
+    preip=None
+    dt_prechange=None
+    flag_update=False
+
+    if LOG_VERBOSE == True : write_log('Start',LOGLEVEL_INFO)
+
+    # 変更履歴ファイルから前回のIPアドレスと変更時刻を取得
+    (preip,dt_prechange,errmsg)=get_prechange(PATH_PRECHANGE)
+    if errmsg != None:
+        write_log(errmsg,LOGLEVEL_ERROR)
+        if messagestore != None : send_mail(MAIL_HOST,MAIL_PORT,MAIL_USER,MAIL_PASSWORD,MAIL_FROM,MAIL_TO,MAIL_SUBJECT,messagestore)
+        return
+    
+    if ENABLE_EXEC_ONLY_WHEN_NEEDED == True :
+        # グローバルIPアドレスを取得
+        (gip,errmsg)=get_globalip()
+        if gip == None or gip == "" :
+            # ここだけ子関数でログ出力した
+            write_log("Failed to get global ip address.",LOGLEVEL_ERROR)
+            if messagestore != None : send_mail(MAIL_HOST,MAIL_PORT,MAIL_USER,MAIL_PASSWORD,MAIL_FROM,MAIL_TO,MAIL_SUBJECT,messagestore)
+            return
+
+        # 前回変更時刻の指定日数後を計算
+        dt_due = dt_prechange + timedelta(days=DAYS_FORCE_UPDATE)
+
+        # 現在の時刻を取得
+        dt_now = datetime.now()
+
+        if LOG_VERBOSE == True : write_log('gip:{} pre gip:{} prechange:{} due:{} now:{}'.format(gip,preip,dt_prechange.strftime('%Y-%m-%d %H:%M:%S'),dt_due.strftime('%Y-%m-%d %H:%M:%S'),dt_now.strftime('%Y-%m-%d %H:%M:%S')),LOGLEVEL_INFO)
+
+        # 記録しているIPアドレスと現在のIPアドレスが異なる
+        # または前回変更時刻から指定日数経過してる
+        # または、DNSのIPアドレスが現在のIPアドレスが異なる場合は
+        # IPアドレスを更新しに行く
+        if dt_now >= dt_due :
+            flag_update = True
+            msg="expiration date. due:{}".format(str(dt_due))
+            write_log(msg,LOGLEVEL_INFO)
+        if gip != preip :
+            flag_update = True
+            msg="Global IP address change detected. {}->{}".format(preip,gip)
+            write_log(msg,LOGLEVEL_INFO)
+        # ここまで着たら更新条件を満たさないので、更新しない
+        
+    else:
+        # 毎回強制アップデート
+        flag_update = True
+
+
+    if flag_update == True:
+        # IPアドレス更新
+        result,gip = update_ip_all(USER_PASSWORD_LIST)
+        if  result == True :
+            # 成功したら変更履歴ファイルを更新
+            errmsg=update_prechange(PATH_PRECHANGE,gip)
+            if errmsg != None:
+                # 変更履歴ファイルを更新の更新に失敗した
+                write_log(errmsg,LOGLEVEL_ERROR)
+                if messagestore != None : send_mail(MAIL_HOST,MAIL_PORT,MAIL_USER,MAIL_PASSWORD,MAIL_FROM,MAIL_TO,MAIL_SUBJECT,messagestore)
+
+                return
+        else:
+            # 失敗した場合
+            pass
+    else:
+        if LOG_VERBOSE == True : write_log('No Update',LOGLEVEL_INFO)
+    
+    if LOG_VERBOSE == True : write_log('End',LOGLEVEL_INFO)
+    
+    # メール送信
+    #if messagestore != None : send_mail(MAIL_HOST,MAIL_PORT,MAIL_USER,MAIL_PASSWORD,MAIL_FROM,MAIL_TO,MAIL_SUBJECT,messagestore)
+    if messagestore != None and (ENABLE_EXEC_ONLY_WHEN_NEEDED == True or ( ENABLE_EXEC_ONLY_WHEN_NEEDED == False and gip != preip )): 
+        send_mail(MAIL_HOST,MAIL_PORT,MAIL_USER,MAIL_PASSWORD,MAIL_FROM,MAIL_TO,MAIL_SUBJECT,messagestore)
+
+if __name__ == "__main__":
+    main()
