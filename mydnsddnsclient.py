@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 #--------------------------------------------------------------------#
-# mydnsddnsclient.py  Ver. 1.0.0(2021/12/20)                         #
+# mydnsddnsclient.py  Ver. 1.0.1(2021/12/12)                         #
 #   MyDNS ダイナミックDNS クライアント(ipv4複数アカウント対応版)     #
 #     Copyright (C) 2021 chidipy  http://chidipy.jpn.com/            #
 #--------------------------------------------------------------------#
@@ -432,7 +432,7 @@ def main():
             return
 
         # 前回変更時刻の指定日数後を計算
-        dt_due = dt_prechange + timedelta(days=DAYS_FORCE_UPDATE)
+        dt_due = dt_prechange.replace(second=0) + timedelta(days=DAYS_FORCE_UPDATE)
 
         # 現在の時刻を取得
         dt_now = datetime.now()
